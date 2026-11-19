@@ -5,6 +5,8 @@ export type BotUi = {
   badge: string;
   headline: string;
   tagline: string;
+  /** Shown instantly as the bot's first message, so the user can start talking right away. */
+  greeting: string;
   suggestions: string[];
 };
 
@@ -14,6 +16,8 @@ export const CUSTOMER_UI: BotUi = {
   badge: "For customers",
   headline: "Protect every device at home",
   tagline: "Ask me anything about Device Secure and Device Secure Gold: plans, coverage and claims.",
+  greeting:
+    "Namaste! Main Zopper ka AI assistant hoon. Aaj kya le rahe hain aap? Bataiye, main samjhaata hoon ki use aur ghar ke baaki devices ko tension-free kaise rakh sakte hain.",
   suggestions: [
     "What's the difference between DS and DSG?",
     "Which devices are covered?",
@@ -28,6 +32,8 @@ export const PROMOTER_UI: BotUi = {
   badge: "Promoters · Internal",
   headline: "Your sales buddy on the floor",
   tagline: "Pitch tips, objection handling, incentives and claims, all in one place.",
+  greeting:
+    "Namaste! Main aapka Zopper Sales Buddy hoon. Pitch ho, incentive ho ya claims, kuch bhi poochho. Aur chaho to main customer ban jaata hoon, ek baar practice kar lete hain!",
   suggestions: [
     "How do I pitch DSG to a customer?",
     "Customer says it's too expensive",

@@ -14,7 +14,10 @@ export class PcmPlayer {
   }
 
   enqueue(base64: string, sampleRate = 24000) {
-    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+    // Plain loop: much faster than Uint8Array.from(str, fn) for ~10 KB chunks arriving many times a second.
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     const pcm = new Int16Array(bytes.buffer, 0, Math.floor(bytes.byteLength / 2));
     if (pcm.length === 0) return;
 
@@ -26,8 +29,10 @@ export class PcmPlayer {
     src.buffer = buffer;
     src.connect(this.ctx.destination);
 
-    // Small 50 ms lead so the first chunk doesn't crackle on slow phones.
-    const startAt = Math.max(this.nextTime, this.ctx.currentTime + 0.05);
+    // When playback starts (or the queue ran dry on a slow network), begin 120 ms ahead so a
+    // little audio is buffered; after that, chunks are scheduled back-to-back with no gaps.
+    const now = this.ctx.currentTime;
+    const startAt = this.nextTime > now + 0.02 ? this.nextTime : now + 0.12;
     src.start(startAt);
     this.nextTime = startAt + buffer.duration;
 

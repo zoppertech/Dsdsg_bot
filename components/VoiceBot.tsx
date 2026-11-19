@@ -1,7 +1,8 @@
 "use client";
 
 import type { LiveServerMessage, Session } from "@google/genai";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { preconnect } from "react-dom";
 import { PcmPlayer, int16ToBase64 } from "@/lib/audioPlayer";
 import { HELPLINE_DISPLAY, HELPLINE_TEL, type BotUi } from "@/lib/botUi";
 
@@ -9,23 +10,65 @@ type Phase = "start" | "connecting" | "live" | "ended" | "error";
 type Activity = "listening" | "thinking" | "speaking";
 type Turn = { id: number; role: "user" | "bot"; text: string };
 type EndReason = "user" | "time" | "idle" | "hidden" | "closed";
+type Limits = { enabled: boolean; maxMinutes: number; idleSeconds: number };
+type TokenResponse = { token: string; model: string; apiVersion: string; limits?: Limits; logTicket?: string };
+/** Why a session ended, as recorded in the logs ("error" = the connection failed). */
+type LoggedEndReason = EndReason | "error";
+/** The conversation being recorded for /api/log (text only, never audio). */
+type LogState = { ticket: string; sessionId: string; startTime: number; connectMs: number; turns: Turn[] };
+
+const LOG_MAX_BYTES = 60_000; // sendBeacon only accepts ~64 KB
+const LOG_MAX_TEXT = 1_500;
+
+/** POST that still gets delivered if the page is closing. */
+function beacon(url: string, body: string) {
+  try {
+    if (navigator.sendBeacon?.(url, new Blob([body], { type: "text/plain" }))) return;
+  } catch {}
+  fetch(url, { method: "POST", body, keepalive: true }).catch(() => {});
+}
+
+/** Save a finished conversation. */
+function sendConversationLog(log: LogState, endReason: LoggedEndReason) {
+  const turns = log.turns
+    .filter((t) => t.text.trim())
+    .map((t) => ({ role: t.role, text: t.text.trim().slice(0, LOG_MAX_TEXT) }));
+  if (!turns.some((t) => t.role === "user")) return; // nothing was asked: nothing to save
+  const meta = { ticket: log.ticket, sessionId: log.sessionId, startTime: log.startTime, endTime: Date.now(), endReason, connectMs: log.connectMs };
+  const build = (n: number) => JSON.stringify({ ...meta, turns: turns.slice(0, n) });
+  let n = turns.length;
+  let body = build(n);
+  while (body.length > LOG_MAX_BYTES && n > 1) body = build(--n); // very long chat: keep the start
+  beacon("/api/log", body);
+}
+
+function newSessionId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx".replace(/x/g, () => Math.floor(Math.random() * 16).toString(16));
+}
+
+/** Thrown inside start() when the user ended the chat before it finished connecting. */
+const ABORTED = Symbol("aborted");
 
 // ---------- cost controls ----------
 // Gemini re-bills the whole conversation (prompt + all audio so far) on every turn,
 // so every second of audio we DON'T send saves money on every later turn too.
-const IDLE_LIMIT_MS = 30_000; // end if nobody speaks or types for 30 s
-const WARN_BEFORE_MS = 60_000; // show "ending soon" 1 minute before the limit
-const HIDDEN_GRACE_MS = 3_000; // end if the user leaves the page / locks the phone
+// Time limit + idle timeout come from the server (.env.local) and are OFF unless SESSION_LIMITS_ENABLED=true.
+const NO_LIMITS: Limits = { enabled: false, maxMinutes: 0, idleSeconds: 0 };
+const WARN_BEFORE_MS = 60_000; // show "This chat will end soon" 1 minute before the limit
+const HIDDEN_GRACE_MS = 3_000; // always on: end if the user leaves the tab / locks the phone (no billing in the background)
 const GATE_MIN_LEVEL = 0.015; // mic level that counts as speech (0..1)
 const GATE_HANGOVER_MS = 1_500; // keep sending this long after speech so Gemini notices the pause
 const PREROLL_CHUNKS = 3; // also send the 300 ms before speech was detected (first word isn't cut)
+const NOISE_MAX_MS = 10_000; // mic open this long with no words recognised = background noise: stop sending
+const THINKING_MAX_MS = 10_000; // "Thinking…" with no reply this long: go back to "Listening…"
 
 const END_NOTES: Record<EndReason, string> = {
-  user: "",
-  time: "This chat reached its time limit.",
+  user: "Thanks for chatting!",
+  time: "This chat reached its time limit. Thanks for chatting!",
   idle: "This chat ended because it was quiet for a while.",
-  hidden: "This chat ended when you left the page.",
-  closed: "",
+  hidden: "This chat ended because you left the page.",
+  closed: "The connection was closed.",
 };
 
 export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string }) {
@@ -39,7 +82,7 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
   const [endingSoon, setEndingSoon] = useState(false);
 
   // Cost-control refs
-  const maxSessionMs = useRef(4 * 60_000);
+  const limitsRef = useRef<Limits>(NO_LIMITS);
   const deadline = useRef(0);
   const lastActivity = useRef(0);
   const tickTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -51,6 +94,7 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
 
   // Refs hold live values that audio callbacks read (state would be stale there).
   const sessionRef = useRef<Session | null>(null);
+  const runRef = useRef(0); // bumped on every start/cleanup, so stale async work can tell it's outdated
   const ctxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
@@ -64,11 +108,26 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
   const dropAudio = useRef(false); // user interrupted: ignore the rest of the current reply
   const pendingQuestion = useRef<string | null>(null);
   const thinkingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stuckTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gateOpenedAt = useRef(0);
   const nextId = useRef(1);
   const userTurnId = useRef<number | null>(null);
   const botTurnId = useRef<number | null>(null);
   const orbRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const logTicket = useRef<string | null>(null);
+  const logRef = useRef<LogState | null>(null);
+  // Logging: one random id per session links the browser events, server events and saved chat.
+  const sessionId = useRef("");
+  const connectStartedAt = useRef(0);
+  const liveStartedAt = useRef(0);
+  const endReasonRef = useRef<LoggedEndReason>("user");
+
+  /** Report a session event to /api/event (no personal data). */
+  const track = (type: string, data: Record<string, string | number | undefined> = {}) => {
+    if (!sessionId.current) return;
+    beacon("/api/event", JSON.stringify({ type, bot: ui.bot, sessionId: sessionId.current, data }));
+  };
 
   const setPhaseBoth = (p: Phase) => {
     phaseRef.current = p;
@@ -77,30 +136,77 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
   const setActivityBoth = (a: Activity) => {
     activityRef.current = a;
     setActivity(a);
-  };
-
-  // ---------- transcript ----------
-  const appendText = (role: Turn["role"], text: string) => {
-    if (!text) return;
-    const idRef = role === "user" ? userTurnId : botTurnId;
-    const id = idRef.current;
-    if (id === null) {
-      const newId = nextId.current++;
-      idRef.current = newId;
-      setTurns((prev) => [...prev, { id: newId, role, text: text.trimStart() }]);
-    } else {
-      setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, text: t.text + text } : t)));
+    // Safety net: if Gemini never replies (e.g. it only heard noise), don't stay on "Thinking…".
+    if (stuckTimer.current) clearTimeout(stuckTimer.current);
+    stuckTimer.current = null;
+    if (a === "thinking") {
+      stuckTimer.current = setTimeout(() => {
+        if (activityRef.current === "thinking" && !botTurnActive.current && phaseRef.current === "live") {
+          finishBotTurn();
+        }
+      }, THINKING_MAX_MS);
     }
   };
 
-  useEffect(() => {
+  // ---------- transcript ----------
+  const appendText = (role: Turn["role"], text: string, { log = true } = {}) => {
+    if (!text) return;
+    const idRef = role === "user" ? userTurnId : botTurnId;
+    const id = idRef.current;
+    // Mirror the transcript into a ref, so it can be saved synchronously when the page closes.
+    const logged = log ? logRef.current : null;
+    if (id === null) {
+      const newId = nextId.current++;
+      idRef.current = newId;
+      const turn = { id: newId, role, text: text.trimStart() };
+      setTurns((prev) => [...prev, turn]);
+      logged?.turns.push({ ...turn });
+    } else {
+      setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, text: t.text + text } : t)));
+      const t = logged?.turns.find((x) => x.id === id);
+      if (t) t.text += text;
+    }
+  };
+
+  /** Send the current conversation to /api/log (once). */
+  const flushLog = () => {
+    if (liveStartedAt.current) {
+      track("session_ended", { reason: endReasonRef.current, seconds: Math.round((Date.now() - liveStartedAt.current) / 1000) });
+      liveStartedAt.current = 0;
+    }
+    const log = logRef.current;
+    logRef.current = null;
+    if (log) sendConversationLog(log, endReasonRef.current);
+  };
+
+  // Follow new text only while the user is at the bottom (don't yank them back if they
+  // scrolled up to re-read). Instant jump while text streams in, so it doesn't stutter.
+  const stickToBottom = useRef(true);
+  const onListScroll = () => {
     const el = listRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
   }, [turns, activity]);
+
+  // Warm up while the user is still reading the start screen, so tapping Start connects faster:
+  // open the connection to Google early and download the Gemini SDK in the background.
+  useEffect(() => {
+    preconnect("https://generativelanguage.googleapis.com");
+    const load = () => import("@google/genai").catch(() => {});
+    const w = window as Window & { requestIdleCallback?: (cb: () => void) => number };
+    if (w.requestIdleCallback) w.requestIdleCallback(load);
+    else setTimeout(load, 1500);
+  }, []);
 
   // ---------- session lifecycle ----------
   const cleanup = () => {
+    flushLog(); // every way a chat can end (button, timeout, tab closed, error) passes through here
+    runRef.current++;
     if (thinkingTimer.current) clearTimeout(thinkingTimer.current);
+    if (stuckTimer.current) clearTimeout(stuckTimer.current);
     if (tickTimer.current) clearInterval(tickTimer.current);
     if (hiddenTimer.current) clearTimeout(hiddenTimer.current);
     tickTimer.current = null;
@@ -122,30 +228,63 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
 
   // End the session if the user leaves the page or locks the phone (no paying for an unattended session).
   useEffect(() => {
+    const isActive = () => phaseRef.current === "live" || phaseRef.current === "connecting";
+
+    // Browsers pause audio while the page is in the background. When the user comes back,
+    // restart it; otherwise the bot's reply never "finishes" and the mic stays blocked.
+    const resumeAudio = () => {
+      if (!isActive() || document.hidden) return;
+      const track = streamRef.current?.getAudioTracks()[0];
+      if (track?.readyState === "ended") return end("hidden"); // the OS took the mic away
+      const ctx = ctxRef.current;
+      if (ctx && ctx.state !== "running") ctx.resume().catch(() => {});
+    };
+
     const onVisibility = () => {
       if (hiddenTimer.current) clearTimeout(hiddenTimer.current);
-      const active = phaseRef.current === "live" || phaseRef.current === "connecting";
-      if (document.hidden && active) hiddenTimer.current = setTimeout(() => end("hidden"), HIDDEN_GRACE_MS);
+      hiddenTimer.current = null;
+      if (!isActive()) return;
+      if (document.hidden) hiddenTimer.current = setTimeout(() => end("hidden"), HIDDEN_GRACE_MS);
+      else resumeAudio();
     };
+
+    // Browser back/forward or closing the tab: end now. Otherwise the page can come back
+    // from the back-forward cache looking "live" with a dead connection.
+    const onPageHide = () => end("hidden");
+
     document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("focus", resumeAudio);
+    // Some phones only allow restarting audio after a tap.
+    document.addEventListener("pointerdown", resumeAudio);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("focus", resumeAudio);
+      document.removeEventListener("pointerdown", resumeAudio);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Runs every second during a session: time limit, "ending soon" warning, idle timeout. */
+  /** Runs every second during a session: time limit, "ending soon" warning, idle timeout. Does nothing if limits are off. */
   const startTicking = () => {
     const now = Date.now();
-    deadline.current = now + maxSessionMs.current;
     lastActivity.current = now;
     if (tickTimer.current) clearInterval(tickTimer.current);
+    tickTimer.current = null;
+    const limits = limitsRef.current;
+    if (!limits.enabled) return;
+    deadline.current = now + limits.maxMinutes * 60_000;
+    const idleMs = limits.idleSeconds * 1000;
     tickTimer.current = setInterval(() => {
       if (phaseRef.current !== "live") return;
       const t = Date.now();
       const left = deadline.current - t;
       if (left <= 0) return end("time");
       if (left <= WARN_BEFORE_MS) setEndingSoon(true);
-      const quiet = activityRef.current === "listening" && !botTurnActive.current && !gateOpen.current;
-      if (quiet && t - lastActivity.current > IDLE_LIMIT_MS) end("idle");
+      // Idle = no recognised words / typing for a while. Mic noise alone doesn't keep the chat alive.
+      const quiet = activityRef.current === "listening" && !botTurnActive.current;
+      if (quiet && t - lastActivity.current > idleMs) end("idle");
     }, 1000);
   };
 
@@ -170,15 +309,27 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
     if (msg.setupComplete) {
       setPhaseBoth("live");
       startTicking();
+      const now = Date.now();
+      const connectMs = now - connectStartedAt.current;
+      liveStartedAt.current = now;
+      track("session_connected", { connectMs });
+      if (logTicket.current) {
+        logRef.current = { ticket: logTicket.current, sessionId: sessionId.current, startTime: now, connectMs, turns: [] };
+      }
       const q = pendingQuestion.current;
       pendingQuestion.current = null;
       if (q) {
         appendText("user", q);
         userTurnId.current = null;
+        sessionRef.current?.sendRealtimeInput({ text: q });
+        setActivityBoth("thinking");
+      } else {
+        // Show the greeting instantly instead of waiting for Gemini to say it:
+        // the user can start talking at once, and we don't pay for a greeting turn.
+        appendText("bot", ui.greeting, { log: false }); // fixed text, not worth saving
+        botTurnId.current = null;
+        setActivityBoth("listening");
       }
-      // With no question, "Hello" makes the bot say its opening line first.
-      sessionRef.current?.sendRealtimeInput({ text: q ?? "Hello" });
-      setActivityBoth("thinking");
       return;
     }
 
@@ -204,6 +355,7 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
     }
 
     if (sc.inputTranscription?.text) {
+      lastActivity.current = Date.now(); // real words heard
       appendText("user", sc.inputTranscription.text);
       // User is talking; if they pause and no reply has started yet, show "thinking".
       if (thinkingTimer.current) clearTimeout(thinkingTimer.current);
@@ -224,9 +376,22 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
     }
   };
 
+  /** Short-lived token from our server (the real API key never reaches the phone). */
+  const fetchToken = async (): Promise<TokenResponse> => {
+    const res = await fetch(`/api/token?bot=${ui.bot}&sid=${sessionId.current}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(secret ? { secret } : {}),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || "Couldn't connect. Please try again.");
+    return body as TokenResponse;
+  };
+
   const start = async (question?: string) => {
     setError("");
     setTurns([]);
+    stickToBottom.current = true;
     setDraft("");
     userTurnId.current = null;
     botTurnId.current = null;
@@ -243,6 +408,24 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
     setMicOn(true);
     setActivityBoth("thinking");
     setPhaseBoth("connecting");
+    sessionId.current = newSessionId();
+    connectStartedAt.current = Date.now();
+    liveStartedAt.current = 0;
+    endReasonRef.current = "user";
+
+    // Every cleanup() bumps runRef, so if the user ends the chat while we're still
+    // connecting, the steps below notice and stop instead of opening a stray session.
+    const run = ++runRef.current;
+    const checkRun = () => {
+      if (run !== runRef.current) throw ABORTED;
+    };
+
+    // Start the slow network steps right away, in parallel with mic setup.
+    let tokenStartedAt = Date.now();
+    let tokenPromise = fetchToken();
+    tokenPromise.catch(() => {}); // handled when awaited below
+    const sdkPromise = import("@google/genai");
+    sdkPromise.catch(() => {});
 
     try {
       // 1) Audio must be created inside the tap, or mobile browsers keep it silent.
@@ -250,15 +433,23 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
         window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const ctx = new AC();
       ctxRef.current = ctx;
-      await ctx.resume();
+      ctx.resume().catch(() => {});
+      // If the OS pauses audio while the page is visible (e.g. a phone call), try to restart it.
+      ctx.onstatechange = () => {
+        if (ctx.state === "closed" || ctx.state === "running" || document.hidden) return;
+        if (phaseRef.current === "live") ctx.resume().catch(() => {});
+      };
 
-      // 2) Microphone.
+      // 2) Microphone + audio worklet, loaded in parallel.
+      const workletReady = ctx.audioWorklet.addModule("/worklets/capture-worklet.js");
+      workletReady.catch(() => {});
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
       });
-      streamRef.current = stream;
-
-      await ctx.audioWorklet.addModule("/worklets/capture-worklet.js");
+      streamRef.current = stream; // store first so cleanup() can release it
+      checkRun();
+      await workletReady;
+      checkRun();
       const worklet = new AudioWorkletNode(ctx, "capture-processor");
       workletRef.current = worklet;
       const mute = ctx.createGain();
@@ -298,16 +489,22 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
           if (preRoll.current.length > PREROLL_CHUNKS) preRoll.current.shift();
           if (loud) {
             gateOpen.current = true;
+            gateOpenedAt.current = now;
             lastLoud.current = now;
-            lastActivity.current = now;
             preRoll.current.forEach(send);
             preRoll.current = [];
           }
         } else {
           send(e.data);
-          if (loud) {
+          const noWords = now - Math.max(gateOpenedAt.current, lastActivity.current) > NOISE_MAX_MS;
+          if (noWords) {
+            // Loud for 10 s but Gemini recognised no words: it's store noise (music, crowd).
+            // Stop streaming it and raise the bar so the same noise doesn't reopen the mic.
+            gateOpen.current = false;
+            noiseFloor.current = Math.max(noiseFloor.current, level);
+            session.sendRealtimeInput({ audioStreamEnd: true });
+          } else if (loud) {
             lastLoud.current = now;
-            lastActivity.current = now;
           } else if (now - lastLoud.current > GATE_HANGOVER_MS) {
             gateOpen.current = false;
             session.sendRealtimeInput({ audioStreamEnd: true }); // tells Gemini the mic paused
@@ -319,31 +516,45 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
         if (turnDone.current) finishBotTurn();
       });
 
-      // 3) Short-lived token from our server (the real API key never reaches the phone).
-      const res = await fetch(`/api/token?bot=${ui.bot}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(secret ? { secret } : {}),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || "Couldn't connect. Please try again.");
-      if (body.maxSessionMinutes) maxSessionMs.current = body.maxSessionMinutes * 60_000;
+      // 3) Short-lived token (fetched in parallel above). A token must be used within
+      // 1 minute, so if the user sat on the mic permission prompt, get a fresh one.
+      if (Date.now() - tokenStartedAt > 45_000) {
+        tokenStartedAt = Date.now();
+        tokenPromise = fetchToken();
+        tokenPromise.catch(() => {});
+      }
+      const body = await tokenPromise;
+      checkRun();
+      limitsRef.current = body.limits ?? NO_LIMITS;
+      logTicket.current = body.logTicket ?? null;
 
       // 4) Connect to Gemini Live. All settings are locked inside the token.
-      const { GoogleGenAI } = await import("@google/genai");
+      const { GoogleGenAI } = await sdkPromise;
+      checkRun();
       const ai = new GoogleGenAI({ apiKey: body.token, httpOptions: { apiVersion: body.apiVersion } });
+      // Callbacks from an old session (after "End chat" / "Talk again") are ignored.
+      const current = () => run === runRef.current;
       sessionRef.current = await ai.live.connect({
         model: body.model,
         config: {},
         callbacks: {
-          onmessage: handleMessage,
-          onerror: () => {
+          onmessage: (msg) => {
+            if (current()) handleMessage(msg);
+          },
+          onerror: (e) => {
+            if (!current()) return;
+            track("connection_dropped", { phase: phaseRef.current, reason: e?.message });
+            endReasonRef.current = "error";
             setError("The connection dropped. Please try again.");
             setPhaseBoth("error");
             cleanup();
           },
-          onclose: () => {
+          onclose: (e) => {
+            if (!current()) return;
             if (phaseRef.current === "live" || phaseRef.current === "connecting") {
+              // Closed by Google, not by us (e.g. the ~15-minute session limit or a network drop).
+              track("connection_dropped", { phase: phaseRef.current, code: e?.code, reason: e?.reason });
+              endReasonRef.current = "closed";
               setEndReason("closed");
               setPhaseBoth("ended");
             }
@@ -351,8 +562,18 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
           },
         },
       });
+      checkRun();
     } catch (err) {
+      if (err === ABORTED) {
+        cleanup(); // user ended the chat while connecting: release whatever was opened
+        return;
+      }
       const name = err instanceof DOMException ? err.name : "";
+      track("connect_failed", {
+        kind: name === "NotAllowedError" ? "mic_denied" : name === "NotFoundError" ? "mic_missing" : "other",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      endReasonRef.current = "error";
       setError(
         name === "NotAllowedError"
           ? "Please allow microphone access in your browser settings, then try again."
@@ -369,6 +590,7 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
 
   const end = (reason: EndReason = "user") => {
     if (phaseRef.current !== "live" && phaseRef.current !== "connecting") return;
+    endReasonRef.current = reason;
     setEndReason(reason);
     setPhaseBoth("ended");
     cleanup();
@@ -379,6 +601,8 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
     micOnRef.current = on;
     setMicOn(on);
     lastActivity.current = Date.now();
+    // Actually mute the microphone (not just stop sending), so nothing is captured while it's off.
+    streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = on));
     if (!on) {
       orbRef.current?.style.setProperty("--level", "0");
       if (gateOpen.current) sessionRef.current?.sendRealtimeInput({ audioStreamEnd: true });
@@ -439,7 +663,7 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
           )}
           {phase === "ended" && END_NOTES[endReason] && (
             <p className="mb-3 rounded-2xl bg-white/10 px-4 py-3 text-center text-sm text-white/85">
-              {END_NOTES[endReason]} Tap below to start a new one.
+              {END_NOTES[endReason]}
             </p>
           )}
 
@@ -531,28 +755,15 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
 
       {endingSoon && (
         <p role="status" className="fade-up mx-auto mt-3 w-fit rounded-full bg-orange/15 px-4 py-2 text-center text-sm font-semibold text-navy">
-          This chat will end in about a minute
+          This chat will end soon
         </p>
       )}
 
-      <div ref={listRef} className="flex-1 overflow-y-auto">
+      <div ref={listRef} onScroll={onListScroll} className="flex-1 overflow-y-auto overscroll-contain">
         <div className="mx-auto max-w-md space-y-3 px-4 py-4">
-          {turns.map((t) =>
-            t.role === "user" ? (
-              <div key={t.id} className="fade-up flex justify-end">
-                <p className="max-w-[85%] rounded-3xl rounded-br-md bg-royal px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
-                  {t.text}
-                </p>
-              </div>
-            ) : (
-              <div key={t.id} className="fade-up flex items-end gap-2">
-                <span className="orb mb-1 h-7 w-7 shrink-0" aria-hidden />
-                <p className="max-w-[80%] rounded-3xl rounded-bl-md bg-white px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ring-1 ring-navy/5">
-                  {t.text}
-                </p>
-              </div>
-            ),
-          )}
+          {turns.map((t) => (
+            <Bubble key={t.id} role={t.role} text={t.text} />
+          ))}
           {!connecting && activity === "thinking" && (
             <div className="fade-up flex items-end gap-2">
               <span className="orb mb-1 h-7 w-7 shrink-0" aria-hidden />
@@ -608,6 +819,24 @@ export default function VoiceBot({ ui, secret }: { ui: BotUi; secret?: string })
 }
 
 // ---------- small pieces ----------
+
+/** One chat bubble. Memoised so streaming text re-renders only the bubble that changed. */
+const Bubble = memo(function Bubble({ role, text }: { role: Turn["role"]; text: string }) {
+  return role === "user" ? (
+    <div className="fade-up flex justify-end">
+      <p className="max-w-[85%] rounded-3xl rounded-br-md bg-royal px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
+        {text}
+      </p>
+    </div>
+  ) : (
+    <div className="fade-up flex items-end gap-2">
+      <span className="orb mb-1 h-7 w-7 shrink-0" aria-hidden />
+      <p className="max-w-[80%] rounded-3xl rounded-bl-md bg-white px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ring-1 ring-navy/5">
+        {text}
+      </p>
+    </div>
+  );
+});
 
 function TopBar({ ui, onEnd }: { ui: BotUi; onEnd?: () => void }) {
   return (
